@@ -1,6 +1,15 @@
 {
   "pins" : [
     {
+      "identity" : "nexus-sdk-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/harden-l/nexus-sdk-ios.git",
+      "state" : {
+        "revision" : "9c191def8ba8ff9a7e295d3693b178fb2228dfb3",
+        "version" : "0.0.4"
+      }
+    },
+    {
       "identity" : "swift-package-manager-google-mobile-ads",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/googleads/swift-package-manager-google-mobile-ads.git",
