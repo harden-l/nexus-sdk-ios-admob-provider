@@ -29,3 +29,5 @@ NexusGrowthAnalyticsAd.shared.initialize(
 ```
 
 The provider version is aligned with the Nexus iOS SDK version.
+
+Full-screen ads are cached by `format + adUnitId`. Duplicate loads are coalesced, a cache miss during `showAd` starts loading for the next attempt, and the provider automatically preloads the next ad after a successful or failed presentation.
