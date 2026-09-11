@@ -6,6 +6,7 @@ import UIKit
 public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
     private let rootViewControllerProvider: @Sendable () -> UIViewController?
     private let revenueReporter: @Sendable (AdRevenuePayload) -> Void
+    private let eventReporter: @Sendable (String, [String: Any?]) -> Void
     private var appOpenAds: [AdCacheKey: AppOpenAd] = [:]
     private var interstitialAds: [AdCacheKey: InterstitialAd] = [:]
     private var rewardedAds: [AdCacheKey: RewardedAd] = [:]
@@ -15,6 +16,7 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
     private var presentedAds: [ObjectIdentifier: PresentedAd] = [:]
     private var presentingKeys = Set<AdCacheKey>()
     private var appOpenPlacement: AdPlacement?
+    private var appOpenLifecycleCallbacks: AdCallbacks?
     private var shouldShowAppOpenOnForeground = false
     private var isShowingAppOpen = false
     private var callbacksByKey: [AdCacheKey: AdCallbacks] = [:]
@@ -23,10 +25,12 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
 
     public init(
         rootViewControllerProvider: @escaping @Sendable () -> UIViewController? = { nil },
-        revenueReporter: @escaping @Sendable (AdRevenuePayload) -> Void = { _ in }
+        revenueReporter: @escaping @Sendable (AdRevenuePayload) -> Void = { _ in },
+        eventReporter: @escaping @Sendable (String, [String: Any?]) -> Void = { _, _ in }
     ) {
         self.rootViewControllerProvider = rootViewControllerProvider
         self.revenueReporter = revenueReporter
+        self.eventReporter = eventReporter
         super.init()
         MobileAds.shared.start(completionHandler: nil)
     }
@@ -142,6 +146,12 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
         callbacks: AdCallbacks? = nil
     ) {
         appOpenPlacement = placement
+        appOpenLifecycleCallbacks = LifecycleAdCallbacks(
+            downstream: callbacks,
+            onShown: { [weak self] placement in
+                self?.eventReporter("ad_show", placement.eventParams())
+            }
+        )
         shouldShowAppOpenOnForeground = showOnForeground
         NotificationCenter.default.addObserver(
             self,
@@ -149,18 +159,19 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
-        loadAd(placement, callbacks: callbacks)
+        loadAd(placement, callbacks: appOpenLifecycleCallbacks)
     }
 
     public func disableAppOpenLifecycle() {
         NotificationCenter.default.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
         appOpenPlacement = nil
+        appOpenLifecycleCallbacks = nil
         shouldShowAppOpenOnForeground = false
     }
 
     @objc private func applicationDidBecomeActive() {
         guard shouldShowAppOpenOnForeground, !isShowingAppOpen, let placement = appOpenPlacement else { return }
-        showAd(placement, callbacks: nil)
+        showAd(placement, callbacks: appOpenLifecycleCallbacks)
     }
 
     public func loadBanner(_ placement: AdPlacement, container: UIView, callbacks: AdCallbacks?) {
@@ -168,7 +179,16 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
         banner.adUnitID = placement.adUnitId
         banner.rootViewController = rootViewControllerProvider()
         attachPaidEventHandler(to: banner, placement: placement)
-        let delegate = BannerDelegateBox(placement: placement, callbacks: callbacks)
+        let delegate = BannerDelegateBox(
+            placement: placement,
+            callbacks: callbacks,
+            onInventory: { [weak self] placement, banner in
+                self?.reportInventory(placement, responseInfo: banner.responseInfo)
+            },
+            onClick: { [weak self] placement, banner in
+                self?.reportClick(placement, responseInfo: banner.responseInfo)
+            }
+        )
         banner.delegate = delegate
         bannerDelegates[placement.placement] = delegate
         container.subviews.forEach { $0.removeFromSuperview() }
@@ -182,9 +202,16 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
     }
 
     public func loadNative(_ placement: AdPlacement, callbacks: NativeAdCallbacks?) {
-        let delegate = NativeDelegateBox(placement: placement, callbacks: callbacks) { [weak self] nativeAd, placement in
-            self?.attachPaidEventHandler(to: nativeAd, placement: placement)
-        }
+        let delegate = NativeDelegateBox(
+            placement: placement,
+            callbacks: callbacks,
+            paidEventHandler: { [weak self] nativeAd, placement in
+                self?.attachPaidEventHandler(to: nativeAd, placement: placement)
+            },
+            eventHandler: { [weak self] name, nativeAd, placement in
+                self?.reportEvent(name, placement: placement, responseInfo: nativeAd.responseInfo)
+            }
+        )
         let loader = AdLoader(
             adUnitID: placement.adUnitId,
             rootViewController: rootViewControllerProvider(),
@@ -214,7 +241,7 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
                     return
                 }
                 self.appOpenAds[key] = ad
-                self.finishLoadSuccessfully(key: key)
+                self.finishLoadSuccessfully(key: key, placement: placement, responseInfo: ad.responseInfo)
             }
         }
     }
@@ -236,7 +263,7 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
                     return
                 }
                 self.interstitialAds[key] = ad
-                self.finishLoadSuccessfully(key: key)
+                self.finishLoadSuccessfully(key: key, placement: placement, responseInfo: ad.responseInfo)
             }
         }
     }
@@ -258,7 +285,7 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
                     return
                 }
                 self.rewardedAds[key] = ad
-                self.finishLoadSuccessfully(key: key)
+                self.finishLoadSuccessfully(key: key, placement: placement, responseInfo: ad.responseInfo)
             }
         }
     }
@@ -280,58 +307,60 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
                     return
                 }
                 self.rewardedInterstitialAds[key] = ad
-                self.finishLoadSuccessfully(key: key)
+                self.finishLoadSuccessfully(key: key, placement: placement, responseInfo: ad.responseInfo)
             }
         }
     }
 
     private func attachPaidEventHandler(to ad: AppOpenAd, placement: AdPlacement) {
         ad.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: ad.responseInfo)
         }
     }
 
     private func attachPaidEventHandler(to ad: InterstitialAd, placement: AdPlacement) {
         ad.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: ad.responseInfo)
         }
     }
 
     private func attachPaidEventHandler(to ad: RewardedAd, placement: AdPlacement) {
         ad.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: ad.responseInfo)
         }
     }
 
     private func attachPaidEventHandler(to ad: RewardedInterstitialAd, placement: AdPlacement) {
         ad.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: ad.responseInfo)
         }
     }
 
     private func attachPaidEventHandler(to banner: BannerView, placement: AdPlacement) {
         banner.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: banner.responseInfo)
         }
     }
 
     private func attachPaidEventHandler(to nativeAd: NativeAd, placement: AdPlacement) {
         nativeAd.paidEventHandler = { [weak self] value in
-            self?.reportPaidEvent(value, placement: placement)
+            self?.reportPaidEvent(value, placement: placement, responseInfo: nativeAd.responseInfo)
         }
     }
 
-    private func reportPaidEvent(_ value: AdValue, placement: AdPlacement) {
+    private func reportPaidEvent(_ value: AdValue, placement: AdPlacement, responseInfo: ResponseInfo?) {
         let revenue = value.value.doubleValue / 1_000_000
+        let source = responseInfo?.loadedAdNetworkResponseInfo
         guard let payload = try? AdRevenuePayload(
-            adPlatform: placement.adPlatform ?? "admob",
-            mediationPlatform: "admob",
+            adPlatform: "admob",
+            mediationPlatform: "admob_mediation",
             adUnitId: placement.adUnitId,
             placement: placement.placement,
             adFormat: placement.format,
             currency: value.currencyCode,
             revenue: revenue,
-            networkFirmId: placement.adPlatformId,
+            networkName: source?.adSourceName ?? placement.adPlatform,
+            networkFirmId: source?.adSourceID ?? placement.adPlatformId,
             scene: placement.placement,
             precision: precisionName(value.precision)
         ) else {
@@ -377,8 +406,13 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
         )
     }
 
-    private func finishLoadSuccessfully(key: AdCacheKey) {
+    private func finishLoadSuccessfully(
+        key: AdCacheKey,
+        placement: AdPlacement,
+        responseInfo: ResponseInfo?
+    ) {
         fullScreenStates[key] = .loaded
+        reportInventory(placement, responseInfo: responseInfo)
         let callbacks = pendingLoadCallbacks.removeValue(forKey: key) ?? []
         callbacks.forEach { $0.callbacks.onLoaded($0.placement) }
     }
@@ -402,6 +436,26 @@ public final class AdMobAdProvider: NSObject, AdProvider, @unchecked Sendable {
         callbacksByKey.removeValue(forKey: item.key)
     }
 
+    private func reportInventory(_ placement: AdPlacement, responseInfo: ResponseInfo?) {
+        reportEvent("ad_inventory", placement: placement, responseInfo: responseInfo)
+    }
+
+    private func reportClick(_ placement: AdPlacement, responseInfo: ResponseInfo?) {
+        reportEvent("ad_click", placement: placement, responseInfo: responseInfo)
+    }
+
+    private func reportEvent(_ name: String, placement: AdPlacement, responseInfo: ResponseInfo?) {
+        let source = responseInfo?.loadedAdNetworkResponseInfo
+        eventReporter(name, [
+            "placement": placement.placement,
+            "ad_unit_id": placement.adUnitId,
+            "ad_format": placement.format.rawValue,
+            "ad_source_name": source?.adSourceName ?? placement.adPlatform,
+            "ad_source_id": source?.adSourceID ?? placement.adPlatformId,
+            "network_firm_id": source?.adSourceID ?? placement.adPlatformId ?? placement.adPlatform ?? "admob"
+        ])
+    }
+
     private func runOnMain(_ action: @escaping () -> Void) {
         if Thread.isMainThread {
             action()
@@ -423,6 +477,7 @@ extension AdMobAdProvider: FullScreenContentDelegate {
 
     public func adDidRecordClick(_ ad: FullScreenPresentingAd) {
         guard let item = presentedAd(for: ad) else { return }
+        reportClick(item.placement, responseInfo: responseInfo(for: ad))
         callbacksByKey[item.key]?.onClicked(item.placement)
     }
 
@@ -446,6 +501,16 @@ extension AdMobAdProvider: FullScreenContentDelegate {
             startNextLoad(item)
         }
         finishPresentation(ad, item: item)
+    }
+
+    private func responseInfo(for ad: FullScreenPresentingAd) -> ResponseInfo? {
+        switch ad {
+        case let ad as AppOpenAd: ad.responseInfo
+        case let ad as InterstitialAd: ad.responseInfo
+        case let ad as RewardedAd: ad.responseInfo
+        case let ad as RewardedInterstitialAd: ad.responseInfo
+        default: nil
+        }
     }
 }
 
@@ -477,16 +542,48 @@ private enum AdLoadState {
     case showing
 }
 
+private final class LifecycleAdCallbacks: AdCallbacks, @unchecked Sendable {
+    private weak var downstream: AdCallbacks?
+    private let onShownHandler: @Sendable (AdPlacement) -> Void
+
+    init(downstream: AdCallbacks?, onShown: @escaping @Sendable (AdPlacement) -> Void) {
+        self.downstream = downstream
+        self.onShownHandler = onShown
+    }
+
+    func onLoaded(_ placement: AdPlacement) { downstream?.onLoaded(placement) }
+    func onShown(_ placement: AdPlacement) {
+        onShownHandler(placement)
+        downstream?.onShown(placement)
+    }
+    func onClicked(_ placement: AdPlacement) { downstream?.onClicked(placement) }
+    func onClosed(_ placement: AdPlacement) { downstream?.onClosed(placement) }
+    func onReward(_ placement: AdPlacement) { downstream?.onReward(placement) }
+    func onFailed(_ placement: AdPlacement, error: Error) {
+        downstream?.onFailed(placement, error: error)
+    }
+}
+
 private final class BannerDelegateBox: NSObject, BannerViewDelegate {
     let placement: AdPlacement
-    weak var callbacks: AdCallbacks?
+    let callbacks: AdCallbacks?
+    let onInventory: (AdPlacement, BannerView) -> Void
+    let onClick: (AdPlacement, BannerView) -> Void
 
-    init(placement: AdPlacement, callbacks: AdCallbacks?) {
+    init(
+        placement: AdPlacement,
+        callbacks: AdCallbacks?,
+        onInventory: @escaping (AdPlacement, BannerView) -> Void,
+        onClick: @escaping (AdPlacement, BannerView) -> Void
+    ) {
         self.placement = placement
         self.callbacks = callbacks
+        self.onInventory = onInventory
+        self.onClick = onClick
     }
 
     func bannerViewDidReceiveAd(_ bannerView: BannerView) {
+        onInventory(placement, bannerView)
         callbacks?.onLoaded(placement)
     }
 
@@ -495,20 +592,32 @@ private final class BannerDelegateBox: NSObject, BannerViewDelegate {
     }
 
     func bannerViewDidRecordClick(_ bannerView: BannerView) {
+        onClick(placement, bannerView)
         callbacks?.onClicked(placement)
+    }
+
+    func bannerViewDidRecordImpression(_ bannerView: BannerView) {
+        callbacks?.onShown(placement)
     }
 }
 
-private final class NativeDelegateBox: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate {
+private final class NativeDelegateBox: NSObject, AdLoaderDelegate, NativeAdLoaderDelegate, NativeAdDelegate {
     let placement: AdPlacement
     weak var callbacks: NativeAdCallbacks?
     let paidEventHandler: (NativeAd, AdPlacement) -> Void
+    let eventHandler: (String, NativeAd, AdPlacement) -> Void
     var loader: AdLoader?
 
-    init(placement: AdPlacement, callbacks: NativeAdCallbacks?, paidEventHandler: @escaping (NativeAd, AdPlacement) -> Void = { _, _ in }) {
+    init(
+        placement: AdPlacement,
+        callbacks: NativeAdCallbacks?,
+        paidEventHandler: @escaping (NativeAd, AdPlacement) -> Void = { _, _ in },
+        eventHandler: @escaping (String, NativeAd, AdPlacement) -> Void = { _, _, _ in }
+    ) {
         self.placement = placement
         self.callbacks = callbacks
         self.paidEventHandler = paidEventHandler
+        self.eventHandler = eventHandler
     }
 
     func adLoader(_ adLoader: AdLoader, didFailToReceiveAdWithError error: Error) {
@@ -516,8 +625,18 @@ private final class NativeDelegateBox: NSObject, AdLoaderDelegate, NativeAdLoade
     }
 
     func adLoader(_ adLoader: AdLoader, didReceive nativeAd: NativeAd) {
+        nativeAd.delegate = self
         paidEventHandler(nativeAd, placement)
+        eventHandler("ad_inventory", nativeAd, placement)
         callbacks?.onLoaded(placement, nativeAd: nativeAd)
+    }
+
+    func nativeAdDidRecordImpression(_ nativeAd: NativeAd) {
+        eventHandler("ad_show", nativeAd, placement)
+    }
+
+    func nativeAdDidRecordClick(_ nativeAd: NativeAd) {
+        eventHandler("ad_click", nativeAd, placement)
     }
 }
 

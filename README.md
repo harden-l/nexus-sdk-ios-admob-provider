@@ -20,6 +20,9 @@ let adMob = AdMobAdProvider(
     rootViewControllerProvider: { rootViewController },
     revenueReporter: { payload in
         _ = try? NexusGrowthAnalyticsAd.shared.reportAdRevenue(payload)
+    },
+    eventReporter: { eventName, params in
+        _ = try? NexusGrowthAnalyticsAd.shared.track(eventName, params: params)
     }
 )
 NexusGrowthAnalyticsAd.shared.initialize(
